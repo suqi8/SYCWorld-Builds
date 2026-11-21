@@ -1,0 +1,205 @@
+name: build
+
+# 只能由有写权限的人手动触发：没有 push / pull_request 触发器，外人提的 PR 拿不到 secrets，也跑不了这个流程。
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "源码仓库的分支或提交"
+        required: true
+        default: "overhaul/syc-v2"
+      target:
+        description: "release=正式包（未签名 APK + 服务端 jar + 管理端）；check=全量检查与测试；ios=iOS 编译；all=全部"
+        type: choice
+        options: [release, check, ios, all]
+        default: release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.event.inputs.target }}
+  cancel-in-progress: false
+
+env:
+  # 公开仓库的日志所有人可见：构建输出一律写进文件、随产物加密，日志里只留任务结论。
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+  SRC_REPO: suqi8/SYCWorldProject
+
+jobs:
+  linux:
+    if: inputs.target != 'ios'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout source (private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SRC_TOKEN }}
+          path: src
+          fetch-depth: 0          # versionCode 取提交数
+          persist-credentials: false
+
+      - name: Use preinstalled JDK 21
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+
+      # 只缓存第三方依赖（下载的 jar 与 Kotlin/Native 工具链），不缓存构建缓存与编译产物：
+      # 公开仓库的缓存在某些情况下可被别的工作流读取，里面不能有本项目编译出来的东西。
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper
+            ~/.konan/dependencies
+            ~/.konan/kotlin-native-prebuilt-*
+          key: deps-linux-${{ hashFiles('src/gradle/libs.versions.toml', 'src/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: deps-linux-
+
+      - name: Build
+        id: build
+        working-directory: src
+        env:
+          TARGET: ${{ inputs.target }}
+          SYC_RELEASE_BASE_URL: ${{ secrets.SYC_RELEASE_BASE_URL }}
+          SYC_LAN_HINTS: ${{ secrets.SYC_LAN_HINTS }}
+        run: |
+          set +e
+          chmod +x gradlew
+          mkdir -p ../out
+          COMMON="--no-daemon --max-workers=4 --console=plain --no-configuration-cache -Dorg.gradle.caching=false"
+          code=0
+          if [ "$TARGET" = "check" ] || [ "$TARGET" = "all" ]; then
+            ./gradlew $COMMON uiGuard :composeApp:compileKotlinWasmJs :adminApp:compileKotlinWasmJs :app:assembleDebug \
+              :composeApp:desktopTest :syc-ui:desktopTest :shared:desktopTest :rtc:desktopTest :composeApp:testAndroidHostTest \
+              :server:test --continue > ../out/check.log 2>&1
+            c=$?; [ $c -ne 0 ] && code=$c
+            echo "check exit=$c"
+          fi
+          if [ "$TARGET" = "release" ] || [ "$TARGET" = "all" ]; then
+            ARGS=""
+            [ -n "$SYC_RELEASE_BASE_URL" ] && ARGS="$ARGS -PsycReleaseBaseUrl=$SYC_RELEASE_BASE_URL"
+            [ -n "$SYC_LAN_HINTS" ] && ARGS="$ARGS -PsycLanHints=$SYC_LAN_HINTS"
+            ./gradlew $COMMON :app:assembleRelease $ARGS :server:buildFatJar -x createExe :adminApp:wasmJsBrowserDistribution \
+              > ../out/release.log 2>&1
+            c=$?; [ $c -ne 0 ] && code=$c
+            echo "release exit=$c"
+          fi
+          # 公开日志只给结论：失败的任务名与测试计数，不含源码行与报错正文
+          grep -hE '^> Task .* FAILED|^BUILD (SUCCESSFUL|FAILED)|tests completed' ../out/*.log || true
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Collect outputs
+        working-directory: src
+        run: |
+          mkdir -p ../out/files
+          cp -f app/build/outputs/apk/release/*.apk ../out/files/ 2>/dev/null || true
+          cp -f server/build/libs/server-all.jar ../out/files/ 2>/dev/null || true
+          if [ -d adminApp/build/dist/wasmJs/productionExecutable ]; then
+            tar -czf ../out/files/admin-web.tar.gz -C adminApp/build/dist/wasmJs productionExecutable
+          fi
+          # 测试报告（只在 check 时有）
+          find . -path '*/build/test-results/*' -name '*.xml' -print0 2>/dev/null | tar -czf ../out/files/test-results.tar.gz --null -T - 2>/dev/null || true
+          git rev-parse HEAD > ../out/files/commit.txt
+
+      - name: Encrypt outputs
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
+        run: |
+          test -n "$ARTIFACT_PASSWORD" || { echo "缺少 ARTIFACT_PASSWORD"; exit 1; }
+          tar -czf bundle.tar.gz -C out .
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in bundle.tar.gz -out bundle.tar.gz.enc -pass env:ARTIFACT_PASSWORD
+          rm -rf bundle.tar.gz out
+
+      - name: Upload encrypted bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ inputs.target }}
+          path: bundle.tar.gz.enc
+          retention-days: 3
+
+      - name: Result
+        run: test "${{ steps.build.outputs.code }}" = "0"
+
+  ios:
+    if: inputs.target == 'ios' || inputs.target == 'all'
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout source (private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SRC_TOKEN }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Use preinstalled JDK 21
+        run: |
+          JH="${JAVA_HOME_21_arm64:-$JAVA_HOME_21_X64}"
+          echo "JAVA_HOME=$JH" >> "$GITHUB_ENV"
+          echo "$JH/bin" >> "$GITHUB_PATH"
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper
+            ~/.konan/dependencies
+            ~/.konan/kotlin-native-prebuilt-*
+          key: deps-macos-${{ hashFiles('src/gradle/libs.versions.toml', 'src/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: deps-macos-
+
+      - name: Build iOS
+        id: build
+        working-directory: src
+        run: |
+          set +e
+          chmod +x gradlew
+          mkdir -p ../out
+          ./gradlew --no-daemon --console=plain --no-configuration-cache -Dorg.gradle.caching=false \
+            :composeApp:compileKotlinIosArm64 :composeApp:linkDebugFrameworkIosSimulatorArm64 > ../out/ios-gradle.log 2>&1
+          g=$?
+          echo "gradle exit=$g"
+          x=0
+          if [ $g -eq 0 ]; then
+            # 模拟器调试构建，不签名；验证 Swift 宿主、SPM 依赖（WebRTC）与 Kotlin framework 能链接在一起
+            xcodebuild -project iosApp/iosApp.xcodeproj -scheme iosApp -configuration Debug \
+              -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+              CODE_SIGNING_ALLOWED=NO build > ../out/ios-xcode.log 2>&1
+            x=$?
+            echo "xcodebuild exit=$x"
+          fi
+          grep -hE '^> Task .* FAILED|^BUILD (SUCCESSFUL|FAILED)|\*\* BUILD (SUCCEEDED|FAILED) \*\*' ../out/*.log || true
+          code=$g; [ $x -ne 0 ] && code=$x
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Encrypt logs
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
+        run: |
+          test -n "$ARTIFACT_PASSWORD" || { echo "缺少 ARTIFACT_PASSWORD"; exit 1; }
+          git -C src rev-parse HEAD > out/commit.txt
+          tar -czf bundle.tar.gz -C out .
+          # 系统自带的是 LibreSSL，用 Homebrew 的 OpenSSL 3，保证与 Linux、Windows 解密参数一致
+          "$(brew --prefix openssl@3)/bin/openssl" enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in bundle.tar.gz -out bundle.tar.gz.enc -pass env:ARTIFACT_PASSWORD
+          rm -rf bundle.tar.gz out
+
+      - name: Upload encrypted bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios
+          path: bundle.tar.gz.enc
+          retention-days: 3
+
+      - name: Result
+        run: test "${{ steps.build.outputs.code }}" = "0"
