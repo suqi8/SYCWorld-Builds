@@ -9,9 +9,9 @@ on:
         required: true
         default: "overhaul/syc-v2"
       target:
-        description: "release=正式包（未签名 APK + 服务端 jar + 管理端）；check=全量检查与测试；ios=iOS 编译；all=全部"
+        description: "release=正式包（未签名 APK + 服务端 jar + 管理端）；check=全量检查与测试；ios=iOS 编译；ipa=iOS 真机 Release 未签名 IPA；all=全部"
         type: choice
-        options: [release, check, ios, all]
+        options: [release, check, ios, ipa, all]
         default: release
 
 permissions:
@@ -28,7 +28,7 @@ env:
 
 jobs:
   linux:
-    if: inputs.target != 'ios'
+    if: inputs.target != 'ios' && inputs.target != 'ipa'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -124,10 +124,10 @@ jobs:
           retention-days: 3
 
       - name: Result
-        run: test "${{ steps.build.outputs.code }}" = "0"
+        run: test "${{ steps.build.outputs.code }}${{ steps.ipa.outputs.code }}" = "0"
 
   ios:
-    if: inputs.target == 'ios' || inputs.target == 'all'
+    if: inputs.target == 'ios' || inputs.target == 'ipa' || inputs.target == 'all'
     runs-on: macos-latest
     timeout-minutes: 120
     steps:
@@ -160,6 +160,7 @@ jobs:
 
       - name: Build iOS
         id: build
+        if: inputs.target != 'ipa'
         working-directory: src
         run: |
           set +e
@@ -183,6 +184,37 @@ jobs:
           echo "code=$code" >> "$GITHUB_OUTPUT"
           exit 0
 
+      # 真机 Release、不签名，打成 Payload/*.app 的 IPA；装机前用自己的证书重签（Sideloadly / AltStore 等）。
+      - name: Build IPA
+        id: ipa
+        if: inputs.target == 'ipa'
+        working-directory: src
+        env:
+          SYC_RELEASE_BASE_URL: ${{ secrets.SYC_RELEASE_BASE_URL }}
+        run: |
+          set +e
+          chmod +x gradlew
+          mkdir -p ../out
+          BUILD_NO=$(git rev-list --count HEAD)
+          EXTRA=""
+          [ -n "$SYC_RELEASE_BASE_URL" ] && EXTRA="SYC_BASE_URL=$SYC_RELEASE_BASE_URL"
+          # Xcode 的构建阶段会调 gradlew :composeApp:embedAndSignAppleFrameworkForXcode（按 Release + iphoneos 出 arm64 framework）
+          xcodebuild -project iosApp/iosApp.xcodeproj -scheme iosApp -configuration Release             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath ../dd             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""             CURRENT_PROJECT_VERSION=$BUILD_NO $EXTRA build > ../out/ipa-xcode.log 2>&1
+          x=$?
+          echo "xcodebuild exit=$x"
+          p=0
+          if [ $x -eq 0 ]; then
+            APP=$(ls -d ../dd/Build/Products/Release-iphoneos/*.app | head -1)
+            mkdir -p ../pkg/Payload && cp -R "$APP" ../pkg/Payload/
+            (cd ../pkg && zip -qry "../out/SYCWorld-b${BUILD_NO}-unsigned.ipa" Payload)
+            p=$?
+            echo "ipa exit=$p"
+          fi
+          grep -hE '^> Task .* FAILED|^BUILD (SUCCESSFUL|FAILED)|\*\* BUILD (SUCCEEDED|FAILED) \*\*' ../out/*.log || true
+          code=$x; [ $p -ne 0 ] && code=$p
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
       - name: Encrypt logs
         env:
           ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
@@ -202,4 +234,4 @@ jobs:
           retention-days: 3
 
       - name: Result
-        run: test "${{ steps.build.outputs.code }}" = "0"
+        run: test "${{ steps.build.outputs.code }}${{ steps.ipa.outputs.code }}" = "0"
